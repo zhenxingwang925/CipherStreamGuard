@@ -1,7 +1,10 @@
 #ifndef __CSG_PRE_WRITE_H__
 #define __CSG_PRE_WRITE_H__
 
+
 #include "csgGlobal.h"
+#include "csgStruct.h"
+
 
 FLT_PREOP_CALLBACK_STATUS
 csgPreWriteBuffers(
