@@ -1,5 +1,6 @@
-#include "csgPreWrite.h"
+#include "csgWrite.h"
 
+extern NPAGED_LOOKASIDE_LIST Pre2PostContextList;
 
 FLT_PREOP_CALLBACK_STATUS
 csgPreWriteBuffers(

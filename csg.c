@@ -26,45 +26,25 @@ Environment:
 --*/
 
 #include "csgGlobal.h"
+#include "csgDirCtrl.h"
+#include "csgRead.h"
+#include "csgWrite.h"
 
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
 
 PFLT_FILTER gFilterHandle;
 
+ULONG LoggingFlags = 0;             // all disabled by default
+
 #define MIN_SECTOR_SIZE 0x200
-
-
-//
-//  This is a context structure that is used to pass state from our
-//  pre-operation callback to our post-operation callback.
-//
-
-typedef struct _PRE_2_POST_CONTEXT {
-
-    //
-    //  Pointer to our volume context structure.  We always get the context
-    //  in the preOperation path because you can not safely get it at DPC
-    //  level.  We then release it in the postOperation path.  It is safe
-    //  to release contexts at DPC level.
-    //
-
-    PVOLUME_CONTEXT VolCtx;
-
-    //
-    //  Since the post-operation parameters always receive the "original"
-    //  parameters passed to the operation, we need to pass our new destination
-    //  buffer to our post operation routine so we can free it.
-    //
-
-    PVOID SwappedBuffer;
-
-} PRE_2_POST_CONTEXT, *PPRE_2_POST_CONTEXT;
 
 //
 //  This is a lookAside list used to allocate our pre-2-post structure.
 //
 
 NPAGED_LOOKASIDE_LIST Pre2PostContextList;
+
+CSG_GLOBAL_DATA g_Global;
 
 /*************************************************************************
     Prototypes
@@ -527,32 +507,8 @@ DriverEntry (
     __in PDRIVER_OBJECT DriverObject,
     __in PUNICODE_STRING RegistryPath
     )
-/*++
-
-Routine Description:
-
-    This is the initialization routine.  This registers with FltMgr and
-    initializes all global data structures.
-
-Arguments:
-
-    DriverObject - Pointer to driver object created by the system to
-        represent this driver.
-
-    RegistryPath - Unicode string identifying where the parameters for this
-        driver are located in the registry.
-
-Return Value:
-
-    Status of the operation
-
---*/
 {
     NTSTATUS status;
-
-    //
-    //  Get debug trace flags
-    //
 
     ReadDriverParameters( RegistryPath );
 
@@ -610,36 +566,12 @@ NTSTATUS
 FilterUnload (
     __in FLT_FILTER_UNLOAD_FLAGS Flags
     )
-/*++
-
-Routine Description:
-
-    Called when this mini-filter is about to be unloaded.  We unregister
-    from the FltMgr and then return it is OK to unload
-
-Arguments:
-
-    Flags - Indicating if this is a mandatory unload.
-
-Return Value:
-
-    Returns the final status of this operation.
-
---*/
 {
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER( Flags );
 
-    //
-    //  Unregister from FLT mgr
-    //
-
     FltUnregisterFilter( gFilterHandle );
-
-    //
-    //  Delete lookaside list
-    //
 
     ExDeleteNPagedLookasideList( &Pre2PostContextList );
 
@@ -647,376 +579,10 @@ Return Value:
 }
 
 
-/*************************************************************************
-    MiniFilter callback routines.
-*************************************************************************/
-
-
-
-
-
-
-FLT_POSTOP_CALLBACK_STATUS
-csgPostDirCtrlBuffers(
-    __inout PFLT_CALLBACK_DATA Data,
-    __in PCFLT_RELATED_OBJECTS FltObjects,
-    __in PVOID CompletionContext,
-    __in FLT_POST_OPERATION_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    This routine does the post Directory Control buffer swap handling.
-
-Arguments:
-
-    This routine does postRead buffer swap handling
-    Data - Pointer to the filter callbackData that is passed to us.
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance, its associated volume and
-        file object.
-
-    CompletionContext - The completion context set in the pre-operation routine.
-
-    Flags - Denotes whether the completion is successful or is being drained.
-
-Return Value:
-
-    FLT_POSTOP_FINISHED_PROCESSING
-    FLT_POSTOP_MORE_PROCESSING_REQUIRED
-
---*/
-{
-    PVOID origBuf;
-    PFLT_IO_PARAMETER_BLOCK iopb = Data->Iopb;
-    FLT_POSTOP_CALLBACK_STATUS retValue = FLT_POSTOP_FINISHED_PROCESSING;
-    PPRE_2_POST_CONTEXT p2pCtx = CompletionContext;
-    BOOLEAN cleanupAllocatedBuffer = TRUE;
-
-    //
-    //  Verify we are not draining an operation with swapped buffers
-    //
-
-    ASSERT(!FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING));
-
-    try {
-
-        //
-        //  If the operation failed or the count is zero, there is no data to
-        //  copy so just return now.
-        //
-
-        if (!NT_SUCCESS(Data->IoStatus.Status) ||
-            (Data->IoStatus.Information == 0)) {
-
-            LOG_PRINT( LOGFL_DIRCTRL,
-                       ("csg!csgPostDirCtrlBuffers:         %wZ newB=%p No data read, status=%x, info=%x\n",
-                        &p2pCtx->VolCtx->Name,
-                        p2pCtx->SwappedBuffer,
-                        Data->IoStatus.Status,
-                        Data->IoStatus.Information) );
-
-            leave;
-        }
-
-        //
-        //  We need to copy the read data back into the users buffer.  Note
-        //  that the parameters passed in are for the users original buffers
-        //  not our swapped buffers
-        //
-
-        if (iopb->Parameters.DirectoryControl.QueryDirectory.MdlAddress != NULL) {
-
-            //
-            //  There is a MDL defined for the original buffer, get a
-            //  system address for it so we can copy the data back to it.
-            //  We must do this because we don't know what thread context
-            //  we are in.
-            //
-
-            origBuf = MmGetSystemAddressForMdlSafe( iopb->Parameters.DirectoryControl.QueryDirectory.MdlAddress,
-                                                    NormalPagePriority );
-
-            if (origBuf == NULL) {
-
-                LOG_PRINT( LOGFL_ERRORS,
-                           ("csg!csgPostDirCtrlBuffers:         %wZ Failed to get system address for MDL: %p\n",
-                            &p2pCtx->VolCtx->Name,
-                            iopb->Parameters.DirectoryControl.QueryDirectory.MdlAddress) );
-
-                //
-                //  If we failed to get a SYSTEM address, mark that the
-                //  operation failed and return.
-                //
-
-                Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-                Data->IoStatus.Information = 0;
-                leave;
-            }
-
-        } else if (FlagOn(Data->Flags,FLTFL_CALLBACK_DATA_SYSTEM_BUFFER) ||
-                   FlagOn(Data->Flags,FLTFL_CALLBACK_DATA_FAST_IO_OPERATION)) {
-
-            //
-            //  If this is a system buffer, just use the given address because
-            //      it is valid in all thread contexts.
-            //  If this is a FASTIO operation, we can just use the
-            //      buffer (inside a try/except) since we know we are in
-            //      the correct thread context.
-            //
-
-            origBuf = iopb->Parameters.DirectoryControl.QueryDirectory.DirectoryBuffer;
-
-        } else {
-
-            //
-            //  They don't have a MDL and this is not a system buffer
-            //  or a fastio so this is probably some arbitrary user
-            //  buffer.  We can not do the processing at DPC level so
-            //  try and get to a safe IRQL so we can do the processing.
-            //
-
-            if (FltDoCompletionProcessingWhenSafe( Data,
-                                                   FltObjects,
-                                                   CompletionContext,
-                                                   Flags,
-                                                   SwapPostDirCtrlBuffersWhenSafe,
-                                                   &retValue )) {
-
-                //
-                //  This operation has been moved to a safe IRQL, the called
-                //  routine will do (or has done) the freeing so don't do it
-                //  in our routine.
-                //
-
-                cleanupAllocatedBuffer = FALSE;
-
-            } else {
-
-                //
-                //  We are in a state where we can not get to a safe IRQL and
-                //  we do not have a MDL.  There is nothing we can do to safely
-                //  copy the data back to the users buffer, fail the operation
-                //  and return.  This shouldn't ever happen because in those
-                //  situations where it is not safe to post, we should have
-                //  a MDL.
-                //
-
-                LOG_PRINT( LOGFL_ERRORS,
-                           ("csg!csgPostDirCtrlBuffers:         %wZ Unable to post to a safe IRQL\n",
-                            &p2pCtx->VolCtx->Name) );
-
-                Data->IoStatus.Status = STATUS_UNSUCCESSFUL;
-                Data->IoStatus.Information = 0;
-            }
-
-            leave;
-        }
-
-        //
-        //  We either have a system buffer or this is a fastio operation
-        //  so we are in the proper context.  Copy the data handling an
-        //  exception.
-        //
-        //  NOTE:  Due to a bug in FASTFAT where it is returning the wrong
-        //         length in the information field (it is sort) we are always
-        //         going to copy the original buffer length.
-        //
-
-        try {
-
-            RtlCopyMemory( origBuf,
-                           p2pCtx->SwappedBuffer,
-                           /*Data->IoStatus.Information*/
-                           iopb->Parameters.DirectoryControl.QueryDirectory.Length );
-
-        } except (EXCEPTION_EXECUTE_HANDLER) {
-
-            Data->IoStatus.Status = GetExceptionCode();
-            Data->IoStatus.Information = 0;
-
-            LOG_PRINT( LOGFL_ERRORS,
-                       ("csg!csgPostDirCtrlBuffers:         %wZ Invalid user buffer, oldB=%p, status=%x, info=%x\n",
-                        &p2pCtx->VolCtx->Name,
-                        origBuf,
-                        Data->IoStatus.Status,
-                        Data->IoStatus.Information) );
-        }
-
-    } finally {
-
-        //
-        //  If we are supposed to, cleanup the allocate memory and release
-        //  the volume context.  The freeing of the MDL (if there is one) is
-        //  handled by FltMgr.
-        //
-
-        if (cleanupAllocatedBuffer) {
-
-            LOG_PRINT( LOGFL_DIRCTRL,
-                       ("csg!csgPostDirCtrlBuffers:         %wZ newB=%p info=%d Freeing\n",
-                        &p2pCtx->VolCtx->Name,
-                        p2pCtx->SwappedBuffer,
-                        Data->IoStatus.Information) );
-
-            ExFreePool( p2pCtx->SwappedBuffer );
-            FltReleaseContext( p2pCtx->VolCtx );
-
-            ExFreeToNPagedLookasideList( &Pre2PostContextList,
-                                         p2pCtx );
-        }
-    }
-
-    return retValue;
-}
-
-
-FLT_POSTOP_CALLBACK_STATUS
-SwapPostDirCtrlBuffersWhenSafe (
-    __inout PFLT_CALLBACK_DATA Data,
-    __in PCFLT_RELATED_OBJECTS FltObjects,
-    __in PVOID CompletionContext,
-    __in FLT_POST_OPERATION_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    We had an arbitrary users buffer without a MDL so we needed to get
-    to a safe IRQL so we could lock it and then copy the data.
-
-Arguments:
-
-    Data - Pointer to the filter callbackData that is passed to us.
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance, its associated volume and
-        file object.
-
-    CompletionContext - The buffer we allocated and swapped to
-
-    Flags - Denotes whether the completion is successful or is being drained.
-
-Return Value:
-
-    FLT_POSTOP_FINISHED_PROCESSING - This is always returned.
-
---*/
-{
-    PFLT_IO_PARAMETER_BLOCK iopb = Data->Iopb;
-    PPRE_2_POST_CONTEXT p2pCtx = CompletionContext;
-    PVOID origBuf;
-    NTSTATUS status;
-
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-    ASSERT(Data->IoStatus.Information != 0);
-
-    //
-    //  This is some sort of user buffer without a MDL, lock the
-    //  user buffer so we can access it
-    //
-
-    status = FltLockUserBuffer( Data );
-
-    if (!NT_SUCCESS(status)) {
-
-        LOG_PRINT( LOGFL_ERRORS,
-                   ("csg!SwapPostDirCtrlBuffersWhenSafe: %wZ Could not lock user buffer, oldB=%p, status=%x\n",
-                    &p2pCtx->VolCtx->Name,
-                    iopb->Parameters.DirectoryControl.QueryDirectory.DirectoryBuffer,
-                    status) );
-
-        //
-        //  If we can't lock the buffer, fail the operation
-        //
-
-        Data->IoStatus.Status = status;
-        Data->IoStatus.Information = 0;
-
-    } else {
-
-        //
-        //  Get a system address for this buffer.
-        //
-
-        origBuf = MmGetSystemAddressForMdlSafe( iopb->Parameters.DirectoryControl.QueryDirectory.MdlAddress,
-                                                NormalPagePriority );
-
-        if (origBuf == NULL) {
-
-            LOG_PRINT( LOGFL_ERRORS,
-                       ("csg!SwapPostDirCtrlBuffersWhenSafe: %wZ Failed to get System address for MDL: %p\n",
-                        &p2pCtx->VolCtx->Name,
-                        iopb->Parameters.DirectoryControl.QueryDirectory.MdlAddress) );
-
-            //
-            //  If we couldn't get a SYSTEM buffer address, fail the operation
-            //
-
-            Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-            Data->IoStatus.Information = 0;
-
-        } else {
-
-            //
-            //  Copy the data back to the original buffer
-            //
-            //  NOTE:  Due to a bug in FASTFAT where it is returning the wrong
-            //         length in the information field (it is short) we are
-            //         always going to copy the original buffer length.
-            //
-
-            RtlCopyMemory( origBuf,
-                           p2pCtx->SwappedBuffer,
-                           /*Data->IoStatus.Information*/
-                           iopb->Parameters.DirectoryControl.QueryDirectory.Length );
-        }
-    }
-
-    //
-    //  Free the memory we allocated and return
-    //
-
-    LOG_PRINT( LOGFL_DIRCTRL,
-               ("csg!SwapPostDirCtrlBuffersWhenSafe: %wZ newB=%p info=%d Freeing\n",
-                &p2pCtx->VolCtx->Name,
-                p2pCtx->SwappedBuffer,
-                Data->IoStatus.Information) );
-
-    ExFreePool( p2pCtx->SwappedBuffer );
-    FltReleaseContext( p2pCtx->VolCtx );
-
-    ExFreeToNPagedLookasideList( &Pre2PostContextList,
-                                 p2pCtx );
-
-    return FLT_POSTOP_FINISHED_PROCESSING;
-}
-
-
 VOID
 ReadDriverParameters (
     __in PUNICODE_STRING RegistryPath
     )
-/*++
-
-Routine Description:
-
-    This routine tries to read the driver-specific parameters from
-    the registry.  These values will be found in the registry location
-    indicated by the RegistryPath passed in.
-
-Arguments:
-
-    RegistryPath - the path key passed to the driver during driver entry.
-
-Return Value:
-
-    None.
-
---*/
 {
     OBJECT_ATTRIBUTES attributes;
     HANDLE driverRegKey;
@@ -1030,11 +596,7 @@ Return Value:
     //  so don't override those settings.
     //
 
-    if (0 == LoggingFlags) {
-
-        //
-        //  Open the desired registry key
-        //
+    if (0 == g_Global.DebugFlags) {
 
         InitializeObjectAttributes( &attributes,
                                     RegistryPath,
@@ -1051,10 +613,6 @@ Return Value:
             return;
         }
 
-        //
-        // Read the given value from the registry.
-        //
-
         RtlInitUnicodeString( &valueName, L"DebugFlags" );
 
         status = ZwQueryValueKey( driverRegKey,
@@ -1066,12 +624,8 @@ Return Value:
 
         if (NT_SUCCESS( status )) {
 
-            LoggingFlags = *((PULONG) &(((PKEY_VALUE_PARTIAL_INFORMATION)buffer)->Data));
+            g_Global.DebugFlags = *((PULONG) &(((PKEY_VALUE_PARTIAL_INFORMATION)buffer)->Data));
         }
-
-        //
-        //  Close the registry entry
-        //
 
         ZwClose(driverRegKey);
     }

@@ -1,4 +1,6 @@
-#include "csgPreRead.h"
+#include "csgRead.h"
+
+extern NPAGED_LOOKASIDE_LIST Pre2PostContextList;
 
 FLT_PREOP_CALLBACK_STATUS
 csgPreReadBuffers(

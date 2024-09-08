@@ -9,5 +9,8 @@ TARGETLIBS= $(TARGETLIBS) \
 C_DEFINES=$(C_DEFINES) -D_WIN2K_COMPAT_SLIST_USAGE
 
 SOURCES=csg.c   \
-        csg.rc
+        csg.rc  \
+        csgDirCtrl.c \
+        csgRead.c    \
+        csgWrite.c   \
 
