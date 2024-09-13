@@ -84,10 +84,14 @@ extern CSG_GLOBAL_DATA g_Global;
 #define LOGFL_DIRCTRL   0x00000008  // if set, display DIRCTRL operation info
 #define LOGFL_VOLCTX    0x00000010  // if set, display VOLCTX operation info
 
-#define LOG_PRINT( _logFlag, _string )                              \
-    (FlagOn(g_Global.DebugFlags,(_logFlag)) ?                     \
-        DbgPrint _string  :                                         \
-        ((int)0))
+#define csg_print_form "[csg] [%d:%d] [%s:%u]: ", PsGetCurrentProcessId(), PsGetCurrentThreadId(), __FUNCTION__, __LINE__
 
+#define LOG_PRINT( _logFlag, _msg )                            \
+    do {                                                       \
+        if (FlagOn(g_Global.DebugFlags, (_logFlag))) {         \
+            DbgPrint(csg_print_form);                          \
+            DbgPrint _msg;                                     \
+        }                                                      \
+    } while(0)
 
 #endif // __CSG_STRUCT_H__

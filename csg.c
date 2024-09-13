@@ -512,12 +512,6 @@ DriverEntry (
 
     ReadDriverParameters( RegistryPath );
 
-    //
-    //  Init lookaside list used to allocate our context structure used to
-    //  pass information from out preOperation callback to our postOperation
-    //  callback.
-    //
-
     ExInitializeNPagedLookasideList( &Pre2PostContextList,
                                      NULL,
                                      NULL,
@@ -525,10 +519,6 @@ DriverEntry (
                                      sizeof(PRE_2_POST_CONTEXT),
                                      PRE_2_POST_TAG,
                                      0 );
-
-    //
-    //  Register with FltMgr
-    //
 
     status = FltRegisterFilter( DriverObject,
                                 &FilterRegistration,
@@ -539,10 +529,6 @@ DriverEntry (
         goto SwapDriverEntryExit;
     }
 
-    //
-    //  Start filtering i/o
-    //
-
     status = FltStartFiltering( gFilterHandle );
 
     if (! NT_SUCCESS( status )) {
@@ -550,6 +536,8 @@ DriverEntry (
         FltUnregisterFilter( gFilterHandle );
         goto SwapDriverEntryExit;
     }
+
+    LOG_PRINT(LOGFL_ERRORS, ("DriverEntry start ok!\n"));
 
 SwapDriverEntryExit:
 
@@ -575,14 +563,16 @@ FilterUnload (
 
     ExDeleteNPagedLookasideList( &Pre2PostContextList );
 
+    LOG_PRINT(LOGFL_ERRORS, ("DriverEntry unload ok!\n"));
+
     return STATUS_SUCCESS;
 }
 
-
+// TODO: Abstract registry functions, All operations require a corresponding func
 VOID
 ReadDriverParameters (
-    __in PUNICODE_STRING RegistryPath
-    )
+      __in PUNICODE_STRING RegistryPath
+      )
 {
     OBJECT_ATTRIBUTES attributes;
     HANDLE driverRegKey;
@@ -591,43 +581,42 @@ ReadDriverParameters (
     UNICODE_STRING valueName;
     UCHAR buffer[sizeof( KEY_VALUE_PARTIAL_INFORMATION ) + sizeof( LONG )];
 
-    //
-    //  If this value is not zero then somebody has already explicitly set it
-    //  so don't override those settings.
-    //
+    g_Global.DebugFlags = LOGFL_ERRORS | LOGFL_READ | LOGFL_WRITE | LOGFL_DIRCTRL | LOGFL_VOLCTX;    // open all
 
-    if (0 == g_Global.DebugFlags) {
+    InitializeObjectAttributes( &attributes,
+                RegistryPath,
+                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                NULL,
+                NULL );
 
-        InitializeObjectAttributes( &attributes,
-                                    RegistryPath,
-                                    OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-                                    NULL,
-                                    NULL );
+    status = ZwOpenKey( &driverRegKey,
+            KEY_READ,
+            &attributes );
 
-        status = ZwOpenKey( &driverRegKey,
-                            KEY_READ,
-                            &attributes );
+    if (!NT_SUCCESS( status )) {
 
-        if (!NT_SUCCESS( status )) {
+        LOG_PRINT(LOGFL_ERRORS, ("ZwOpenKey Error Code: 0x%x\n", status));
 
-            return;
-        }
-
-        RtlInitUnicodeString( &valueName, L"DebugFlags" );
-
-        status = ZwQueryValueKey( driverRegKey,
-                                  &valueName,
-                                  KeyValuePartialInformation,
-                                  buffer,
-                                  sizeof(buffer),
-                                  &resultLength );
-
-        if (NT_SUCCESS( status )) {
-
-            g_Global.DebugFlags = *((PULONG) &(((PKEY_VALUE_PARTIAL_INFORMATION)buffer)->Data));
-        }
-
-        ZwClose(driverRegKey);
+        goto ERROR;
     }
-}
 
+    RtlInitUnicodeString( &valueName, L"DebugFlags" );
+
+    status = ZwQueryValueKey( driverRegKey,
+                &valueName,
+                KeyValuePartialInformation,
+                buffer,
+                sizeof(buffer),
+                &resultLength );
+
+    if (NT_SUCCESS( status )) {
+
+        g_Global.DebugFlags = *((PULONG) &(((PKEY_VALUE_PARTIAL_INFORMATION)buffer)->Data));
+    }
+
+ERROR:
+    if (driverRegKey)
+        ZwClose(driverRegKey);
+    
+    LOG_PRINT(LOGFL_ERRORS, ("Current DebugFlags : 0x%x\n", g_Global.DebugFlags));
+}

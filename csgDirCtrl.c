@@ -1,4 +1,6 @@
 #include "csgDirCtrl.h"
+#include "csgGlobal.h"
+#include "csgStruct.h"
 
 extern NPAGED_LOOKASIDE_LIST Pre2PostContextList;
 
